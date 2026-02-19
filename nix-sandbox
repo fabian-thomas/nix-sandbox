@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# TODO: Consider tighter sandboxing for proc/dev mounts.
+
+# --- config defaults ---
+SANDBOX_DIR="${SANDBOX_DIR:-$PWD}"         # outer -C (mount scope)
+PROJECT_DIR="${PROJECT_DIR:-}"             # inner app -C (cwd inside mount scope)
+SANDBOX_BASE="${SANDBOX_BASE:-${XDG_RUNTIME_DIR:-/tmp}/nix-sandbox}"
+# Minimal PATH exposed inside the sandbox (after clearing host env). Override
+# via SANDBOX_PATH if you need extra directories.
+SANDBOX_PATH_VALUE="${SANDBOX_PATH:-/home/sandbox/.local/state/nix/profile/bin:/home/sandbox/.nix-profile/bin:/usr/bin:/bin}"
+SANDBOX_PRINT_BINDS_VALUE="${SANDBOX_PRINT_BINDS:-0}"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -L)"
+NIX_SHELL_FILE_DEFAULT="${SCRIPT_DIR}/shell.nix"
+if [[ ! -f "$NIX_SHELL_FILE_DEFAULT" && -f "${SCRIPT_DIR}/../share/nix-sandbox/shell.nix" ]]; then
+  NIX_SHELL_FILE_DEFAULT="${SCRIPT_DIR}/../share/nix-sandbox/shell.nix"
+fi
+NIX_SHELL_FILE="${NIX_SHELL_FILE:-$NIX_SHELL_FILE_DEFAULT}"
+if [[ "$NIX_SHELL_FILE" != /* ]]; then
+  NIX_SHELL_FILE_DIR="${NIX_SHELL_FILE%/*}"
+  if [[ "$NIX_SHELL_FILE_DIR" == "$NIX_SHELL_FILE" ]]; then
+    NIX_SHELL_FILE_DIR="."
+  fi
+
+  if NIX_SHELL_FILE_DIR_ABS="$(cd -- "$NIX_SHELL_FILE_DIR" 2>/dev/null && pwd -L)"; then
+    NIX_SHELL_FILE="${NIX_SHELL_FILE_DIR_ABS}/${NIX_SHELL_FILE##*/}"
+  else
+    NIX_SHELL_FILE="$PWD/$NIX_SHELL_FILE"
+  fi
+fi
+NIX_SHELL_HOST_DIR="$(dirname -- "$NIX_SHELL_FILE")"
+SANDBOX_DEVELOPER_INSTRUCTIONS='
+You are running inside a bubblewrap sandbox launched by the host nix-sandbox script.
+Treat this as a constrained runtime with explicit bind mounts.
+
+Sandbox model:
+- The app runs in bubblewrap with a cleared environment and a minimal filesystem view.
+- The project is bind mounted at its original absolute path, so relative and absolute project paths usually work.
+
+What is visible inside sandbox:
+- /tmp and /home/sandbox are per-run roots, then selected host paths are bind mounted.
+- /nix and nix daemon sockets are mounted so nix shell and nix develop can fetch and build.
+- Only selected /etc paths are mounted (for example hosts, resolv.conf, ssl certs, passwd).
+- App specific config and state dirs may be mounted depending on selected app.
+
+Identity and path rules:
+- Do not assume USER and HOME match host defaults.
+- Inside this sandbox, HOME is /home/sandbox and USER/LOGNAME are sandbox.
+- Prefer HOME/XDG variables and current working directory over hardcoded /home/<name> paths.
+
+Environment rules:
+- If there is an .envrc file in the project, run direnv allow once and then use direnv exec . <cmd> for project commands.
+
+Build tool rule:
+- If a gradlew file exists in the project, use ./gradlew.
+- If not, use gradle.
+
+Tooling and package rules:
+- If a tool is missing, prefer nix shell nixpkgs#<tool> -c <cmd> for one-off usage.
+- If a package is likely needed by other contributors, CI, or repeated project builds, add it to the project flake/dev environment (the env loaded by .envrc) instead of relying on ad-hoc installs.
+- If a package is needed repeatedly and does not belong in direnv, use nix profile install nixpkgs#<package>.
+
+Nix-store search rules:
+- Avoid broad recursive searches over /nix/store unless there is no other practical way.
+- First resolve likely package/output paths, then inspect only narrowed store paths.
+- Prefer project files, build logs, compile flags, pkg-config output, and toolchain output paths before searching /nix/store.
+- Prefer nix why-depends or nix path-info -r to identify relevant store paths before searching.
+- For headers and libraries, inspect compile_commands.json, build logs, and pkg-config flags before searching the store.
+- If broad /nix/store search is still needed, briefly explain why a narrower path is not sufficient.
+
+Execution rules:
+- Use larger timeouts proactively for long-running builds (for Android builds, start around 5 minutes) and note the timeout choice briefly.
+'
+
+# If you want extra Nix features:
+# export NIX_CONFIG="experimental-features = nix-command flakes"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  nix-sandbox [--no-git-ro] [--pkgs "pkg1 pkg2 ..."] [--no-net] [-C sandbox_path] <app> [-C project_path] [app args...]
+
+Examples:
+  nix-sandbox codex --version
+  nix-sandbox -C /repo opencode -C apps/mobile
+  nix-sandbox opencode --version
+  nix-sandbox --pkgs "git ripgrep fd" codex plan
+
+Notes:
+  - Before <app>: -C sets SANDBOX_DIR (mount scope)
+  - After <app>: only -C <path> is parsed as PROJECT_DIR (app cwd)
+  - Set SANDBOX_PRINT_BINDS=1 to print the bind plan and exit
+  - With `--pkgs`, packages are provided via `nix shell nixpkgs#pkg ... -c <cmd> ...`
+  - Without `--pkgs`, packages are provided via `nix develop --impure -f $NIX_SHELL_FILE -c <cmd> ...`
+  - By default, .git directories/files inside the project are bound read-only (disable with --no-git-ro)
+  - The sandbox can only see:
+      the project mounted at its original absolute path
+      /nix (shared with host so nix can fetch/build)
+      app-specific dirs (bind-mounted by app rules, if configured)
+      limited /etc files (dns, certs, passwd/group)
+      nix-daemon socket (/nix/var/nix/daemon-socket, /run/nix) for nix
+EOF
+}
+
+PKGS=""
+NO_NET=0
+GIT_RO=1
+
+# Additional flags passed to `nix` (shell/develop). Defaults to enabling nix-command and
+# flakes so we can use the modern CLI + nixpkgs#pkg style selector even when the
+# host configuration disables them.
+NIX_EXTRA_FLAGS_DEFAULT="--extra-experimental-features nix-command --extra-experimental-features flakes"
+NIX_EXTRA_FLAGS_VALUE="${NIX_EXTRA_FLAGS:-$NIX_EXTRA_FLAGS_DEFAULT}"
+NIX_SHELL_FLAGS=()
+if [[ -n "$NIX_EXTRA_FLAGS_VALUE" ]]; then
+  # Intentional word splitting to allow space-separated flag strings.
+  # shellcheck disable=SC2206
+  NIX_SHELL_FLAGS=($NIX_EXTRA_FLAGS_VALUE)
+fi
+
+# --- parse args ---
+APP_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pkgs) PKGS="${2:-}"; shift 2 ;;
+    --no-net) NO_NET=1; shift ;;
+    --no-git-ro) GIT_RO=0; shift ;;
+    -C)
+      if [[ -z "${2:-}" ]]; then
+        echo "error: missing path after -C" >&2
+        exit 1
+      fi
+      SANDBOX_DIR="$2"
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "error: unknown option: $1" >&2; usage; exit 1 ;;
+    *) break ;;
+  esac
+done
+
+if [[ $# -gt 0 ]]; then
+  APP="$1"
+  shift
+fi
+APP_ARGS=("$@")
+
+# Parse app cwd flags from app args and remove them before launching the app
+# inside the sandbox.
+FILTERED_APP_ARGS=()
+idx=0
+while (( idx < ${#APP_ARGS[@]} )); do
+  arg="${APP_ARGS[idx]}"
+  case "$arg" in
+    -C)
+      if (( idx + 1 >= ${#APP_ARGS[@]} )); then
+        echo "error: missing path after $arg" >&2
+        exit 1
+      fi
+      PROJECT_DIR="${APP_ARGS[idx + 1]}"
+      idx=$((idx + 2))
+      ;;
+    *)
+      FILTERED_APP_ARGS+=("$arg")
+      idx=$((idx + 1))
+      ;;
+  esac
+done
+APP_ARGS=("${FILTERED_APP_ARGS[@]}")
+
+if [[ "$GIT_RO" -eq 1 ]]; then
+  SANDBOX_DEVELOPER_INSTRUCTIONS+='
+Git behavior:
+- Git metadata for nested repositories is mounted read only in this run.
+'
+fi
+
+if [[ -z "${APP:-}" ]]; then
+  echo "error: missing app command" >&2
+  usage
+  exit 1
+fi
+
+if ! command -v bwrap >/dev/null 2>&1; then
+  echo "error: bubblewrap (bwrap) not found. Install it (e.g. nix shell nixpkgs#bubblewrap -c ...)." >&2
+  exit 1
+fi
+
+if [[ ! -d "$SANDBOX_DIR" ]]; then
+  echo "error: sandbox dir not found: $SANDBOX_DIR" >&2
+  exit 1
+fi
+if [[ -z "$PKGS" ]]; then
+  if [[ ! -f "$NIX_SHELL_FILE" ]]; then
+    echo "error: shell.nix not found: $NIX_SHELL_FILE" >&2
+    exit 1
+  fi
+fi
+
+HOST_USER="${USER:-}"
+if [[ -z "$HOST_USER" ]]; then
+  HOST_USER="$(id -un 2>/dev/null || echo sandbox)"
+fi
+
+# Resolve logical sandbox root path (no trailing slash).
+if ! SANDBOX_ABS="$(cd "$SANDBOX_DIR" && pwd -L 2>/dev/null)"; then
+  SANDBOX_ABS="$SANDBOX_DIR"
+fi
+SANDBOX_ABS="${SANDBOX_ABS%/}"
+SANDBOX_ABS="${SANDBOX_ABS:-/}"
+
+# Resolve app cwd (PROJECT_DIR) used for launch cwd.
+if [[ -z "$PROJECT_DIR" ]]; then
+  PROJECT_CHDIR="$SANDBOX_ABS"
+elif [[ "$PROJECT_DIR" == /* ]]; then
+  PROJECT_CHDIR="$PROJECT_DIR"
+else
+  PROJECT_CHDIR="$SANDBOX_ABS/$PROJECT_DIR"
+fi
+
+# Resolve the nix binary so we can invoke it even when PATH entries are outside
+# the sandboxed filesystem view.
+if ! NIX_BIN="$(command -v nix)"; then
+  echo "error: nix CLI not found in PATH; install nix or ensure it's on PATH." >&2
+  exit 1
+fi
+if NIX_BIN_REAL="$(readlink -f "$NIX_BIN" 2>/dev/null)"; then
+  NIX_BIN="$NIX_BIN_REAL"
+fi
+
+# Resolve bash so we can advertise a valid SHELL inside the sandbox even if the
+# default /bin/bash path doesn't exist (common on NixOS).
+if BASH_BIN="$(command -v bash 2>/dev/null)"; then
+  if BASH_BIN_REAL="$(readlink -f "$BASH_BIN" 2>/dev/null)"; then
+    BASH_BIN="$BASH_BIN_REAL"
+  fi
+else
+  BASH_BIN="/bin/sh"
+fi
+
+# Resolve core runtime binaries that tools often expect at fixed FHS paths.
+if ! ENV_BIN="$(command -v env 2>/dev/null)"; then
+  echo "error: env binary not found in PATH." >&2
+  exit 1
+fi
+if ENV_BIN_REAL="$(readlink -f "$ENV_BIN" 2>/dev/null)"; then
+  ENV_BIN="$ENV_BIN_REAL"
+fi
+
+if SH_BIN="$(command -v sh 2>/dev/null)"; then
+  if SH_BIN_REAL="$(readlink -f "$SH_BIN" 2>/dev/null)"; then
+    SH_BIN="$SH_BIN_REAL"
+  fi
+else
+  SH_BIN="$BASH_BIN"
+fi
+
+# --- paths inside sandbox ---
+RUN_ID="$(date +%s).$$"
+ROOT="$SANDBOX_BASE/$RUN_ID"
+HOME_DIR="$ROOT/home"
+TMP_DIR="$ROOT/tmp"
+ETC_DIR="$ROOT/etc"
+mkdir -p "$HOME_DIR" "$TMP_DIR" "$ETC_DIR"
+mkdir -p "$HOME_DIR/.config/nix"
+
+# Bind workflow:
+# 1) add_bind_mount records mount specs (rw/ro + type + host + guest)
+# 2) validation + conversion builds BINDS_RW / BINDS_RO bwrap args
+# This keeps all mounts (system/app/workspace/git) on one path.
+BINDS_RW=()
+BINDS_RO=()
+BINDS_RO_PRE_RW=()
+BIND_SPEC_MODES=()
+BIND_SPEC_KINDS=()
+BIND_SPEC_HOSTS=()
+BIND_SPEC_GUESTS=()
+
+add_bind_mount() {
+  # Args: mode(rw|ro) kind(dir|file|path) host_path guest_path
+  local mode="$1"
+  local kind="$2"
+  local host_path="$3"
+  local guest_path="$4"
+  BIND_SPEC_MODES+=("$mode")
+  BIND_SPEC_KINDS+=("$kind")
+  BIND_SPEC_HOSTS+=("$host_path")
+  BIND_SPEC_GUESTS+=("$guest_path")
+}
+
+add_bind_mount rw dir "$TMP_DIR" /tmp
+add_bind_mount rw dir "$HOME_DIR" /home/sandbox
+
+# Compatibility mounts for apps/scripts that hardcode FHS interpreter paths.
+add_bind_mount ro file "$ENV_BIN" /usr/bin/env
+add_bind_mount ro file "$SH_BIN" /bin/sh
+add_bind_mount ro file "$SH_BIN" /usr/bin/sh
+add_bind_mount ro file "$BASH_BIN" /bin/bash
+add_bind_mount ro file "$BASH_BIN" /usr/bin/bash
+
+# Convert pkgs to nix shell args: nixpkgs#foo nixpkgs#bar ...
+# (If user already wrote "flake#pkg", keep as-is.)
+NIX_PKGS=()
+if [[ -n "$PKGS" ]]; then
+  for p in $PKGS; do
+    if [[ "$p" == *"#"* ]]; then
+      NIX_PKGS+=("$p")
+    elif [[ "$p" == "github:"* ]]; then
+      NIX_PKGS+=("$p")
+    else
+      NIX_PKGS+=("nixpkgs#$p")
+    fi
+  done
+fi
+if [[ -z "$PKGS" ]]; then
+  # Mount script dir read-only so shell.nix is available.
+  BINDS_RO_PRE_RW+=(--ro-bind "$NIX_SHELL_HOST_DIR" "$NIX_SHELL_HOST_DIR")
+fi
+
+# Basic /etc bits many tools expect
+for f in /etc/group /etc/nsswitch.conf /etc/hosts /etc/resolv.conf; do
+  [[ -e "$f" ]] && add_bind_mount ro path "$f" "$f"
+done
+# SSL certs (paths vary)
+for d in /etc/ssl/certs /etc/pki/tls/certs /etc/ca-certificates; do
+  [[ -d "$d" ]] && add_bind_mount ro dir "$d" "$d"
+done
+# Nix config (optional but nice)
+[[ -d /etc/nix ]] && add_bind_mount ro dir /etc/nix /etc/nix
+# On NixOS, /etc/static contains generated configuration that /etc files may
+# symlink into (e.g., /etc/nix/registry.json). Bind it so those symlinks
+# continue to work inside the sandbox.
+[[ -e /etc/static ]] && add_bind_mount ro path /etc/static /etc/static
+
+# Copy the host flake registry into sandbox HOME so nix can read and update it
+# without touching the read-only host store-backed path.
+SANDBOX_REGISTRY_PATH=""
+if [[ -e /etc/nix/registry.json ]]; then
+  if cp -L /etc/nix/registry.json "$HOME_DIR/.config/nix/registry.json" 2>/dev/null; then
+    SANDBOX_REGISTRY_PATH="/home/sandbox/.config/nix/registry.json"
+  fi
+fi
+
+# Copy /etc/passwd into the sandbox runtime area and rewrite identity/shell/home
+# for the current user so identity-derived paths match the sandbox env.
+if [[ -r /etc/passwd ]]; then
+  SANDBOX_PASSWD="$ETC_DIR/passwd"
+  if awk -v user="$HOST_USER" -v sandbox_user="sandbox" -v shell="$BASH_BIN" -v home="/home/sandbox" -F: 'BEGIN{OFS=":"} { if ($1 == user) { $1 = sandbox_user; $6 = home; $7 = shell } print }' /etc/passwd > "$SANDBOX_PASSWD.tmp"; then
+    mv "$SANDBOX_PASSWD.tmp" "$SANDBOX_PASSWD"
+    add_bind_mount ro file "$SANDBOX_PASSWD" /etc/passwd
+  else
+    rm -f "$SANDBOX_PASSWD.tmp"
+  fi
+fi
+
+NIX_CONFIG_VALUE="${NIX_CONFIG:-}"
+if [[ -n "$SANDBOX_REGISTRY_PATH" ]]; then
+  if [[ -n "$NIX_CONFIG_VALUE" ]]; then
+    NIX_CONFIG_VALUE+=$'\n'
+  fi
+  NIX_CONFIG_VALUE+="flake-registry = $SANDBOX_REGISTRY_PATH"
+fi
+
+SETENV_EXTRA=()
+if [[ -n "$NIX_CONFIG_VALUE" ]]; then
+  SETENV_EXTRA+=(--setenv NIX_CONFIG "$NIX_CONFIG_VALUE")
+fi
+if [[ -n "${NIX_PATH:-}" ]]; then
+  SETENV_EXTRA+=(--setenv NIX_PATH "$NIX_PATH")
+fi
+
+# Nix paths we expose read/write so the daemon can materialize store paths and
+# sockets.
+[[ -d /nix ]] && add_bind_mount rw dir /nix /nix
+[[ -d /run/nix ]] && add_bind_mount rw dir /run/nix /run/nix
+
+# Networking: by default we keep the host network namespace so downloads work. If
+# --no-net is set, we unshare the network namespace entirely.
+NET_FLAGS=()
+if [[ "$NO_NET" -eq 1 ]]; then
+  NET_FLAGS+=(--unshare-net)
+fi
+
+UNSHARE_BASE=(--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup)
+
+HOST_XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+HOST_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+HOST_XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+HOST_XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+
+case "$APP" in
+  codex)
+    # Codex: keep runtime state writable, pin config/rules/skills read-only.
+    CODEX_HOST_DIR="${HOST_CODEX_DIR:-$HOME/.codex}"
+    add_bind_mount rw dir "$CODEX_HOST_DIR" /home/sandbox/.codex
+    add_bind_mount ro file "$CODEX_HOST_DIR/config.toml" /home/sandbox/.codex/config.toml
+    add_bind_mount ro dir "$CODEX_HOST_DIR/rules" /home/sandbox/.codex/rules
+    add_bind_mount ro dir "$CODEX_HOST_DIR/skills" /home/sandbox/.codex/skills
+    APP_ARGS+=(-c "developer_instructions=$SANDBOX_DEVELOPER_INSTRUCTIONS")
+    ;;
+  opencode)
+    # OpenCode: keep runtime dirs writable, mount config read-only.
+    add_bind_mount rw dir "$HOST_XDG_CACHE_HOME/opencode" /home/sandbox/.cache/opencode
+    add_bind_mount ro dir "$HOST_XDG_CONFIG_HOME/opencode" /home/sandbox/.config/opencode
+    add_bind_mount rw dir "$HOST_XDG_DATA_HOME/opencode" /home/sandbox/.local/share/opencode
+    add_bind_mount rw dir "$HOST_XDG_STATE_HOME/opencode" /home/sandbox/.local/state/opencode
+
+    OPENCODE_INSTRUCTIONS_HOST="$ROOT/opencode-sandbox-instructions.md"
+    OPENCODE_INSTRUCTIONS_GUEST="/tmp/opencode-sandbox-instructions.md"
+    printf '%s\n' "$SANDBOX_DEVELOPER_INSTRUCTIONS" > "$OPENCODE_INSTRUCTIONS_HOST"
+    add_bind_mount ro file "$OPENCODE_INSTRUCTIONS_HOST" "$OPENCODE_INSTRUCTIONS_GUEST"
+
+    # Sandbox-only OpenCode instructions via env-injected config content.
+    OPENCODE_CONFIG_CONTENT_VALUE="{\"instructions\":[\"$OPENCODE_INSTRUCTIONS_GUEST\"]}"
+    SETENV_EXTRA+=(--setenv OPENCODE_CONFIG_CONTENT "$OPENCODE_CONFIG_CONTENT_VALUE")
+    ;;
+esac
+
+[[ -d "$HOME/.gradle" ]] && add_bind_mount rw dir "$HOME/.gradle" /home/sandbox/.gradle
+add_bind_mount rw dir "$HOST_XDG_CACHE_HOME/nix" /home/sandbox/.cache/nix
+
+print_bind_triplets() {
+  local -n _arr="$1"
+  local idx
+
+  for ((idx = 0; idx < ${#_arr[@]}; idx += 3)); do
+    printf '  %-12s %q -> %q\n' "${_arr[idx]}" "${_arr[idx + 1]}" "${_arr[idx + 2]}" >&2
+  done
+}
+
+add_bind_mount rw dir "$SANDBOX_ABS" "$SANDBOX_ABS"
+
+# Ensure parent directories for the workspace mount exist in the sandbox rootfs.
+WORKSPACE_MKDIR_FLAGS=()
+ROOTFS_MKDIR_FLAGS=(--dir /bin --dir /usr --dir /usr/bin)
+if [[ "$SANDBOX_ABS" != "/" ]]; then
+  IFS='/' read -r -a _project_parts <<< "${SANDBOX_ABS#/}"
+  current_parent=""
+  last_parent_index=$((${#_project_parts[@]} - 1))
+  for ((i = 0; i < last_parent_index; i++)); do
+    current_parent+="/${_project_parts[i]}"
+    WORKSPACE_MKDIR_FLAGS+=(--dir "$current_parent")
+  done
+fi
+
+if [[ "$GIT_RO" -eq 1 ]]; then
+  while IFS= read -r -d '' gitdir; do
+    [[ -z "$gitdir" ]] && continue
+    if [[ "$gitdir" == "$SANDBOX_ABS" ]]; then
+      continue
+    fi
+    if [[ "$SANDBOX_ABS" == "/" || "$gitdir" == "$SANDBOX_ABS/"* ]]; then
+      add_bind_mount ro path "$gitdir" "$gitdir"
+    fi
+  # Use -H so a symlinked SANDBOX_ABS root (e.g. ~/dotfiles) is traversed,
+  # while still avoiding following symlinks encountered deeper in the tree.
+  done < <(find -H "$SANDBOX_ABS" -name .git -print0 2>/dev/null)
+fi
+
+for (( bind_idx = 0; bind_idx < ${#BIND_SPEC_MODES[@]}; bind_idx++ )); do
+  MOUNT_MODE="${BIND_SPEC_MODES[bind_idx]}"
+  MOUNT_KIND="${BIND_SPEC_KINDS[bind_idx]}"
+  HOST_DIR="${BIND_SPEC_HOSTS[bind_idx]}"
+  GUEST_DIR="${BIND_SPEC_GUESTS[bind_idx]}"
+
+  case "$MOUNT_KIND" in
+    dir)
+      if [[ ! -d "$HOST_DIR" ]]; then
+        echo "error: missing dir: $HOST_DIR" >&2
+        exit 1
+      fi
+      ;;
+    file)
+      if [[ ! -f "$HOST_DIR" ]]; then
+        echo "error: missing file: $HOST_DIR" >&2
+        exit 1
+      fi
+      ;;
+    path)
+      if [[ ! -e "$HOST_DIR" ]]; then
+        echo "error: missing path: $HOST_DIR" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "error: invalid mount kind: $MOUNT_KIND" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$MOUNT_MODE" in
+    rw)
+      BINDS_RW+=(--bind "$HOST_DIR" "$GUEST_DIR")
+      ;;
+    ro)
+      BINDS_RO+=(--ro-bind "$HOST_DIR" "$GUEST_DIR")
+      ;;
+    *)
+      echo "error: invalid mount mode: $MOUNT_MODE" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Run the app inside a minimal FS view, with nix-provided packages.
+# - /nix is bind-mounted read/write so the nix daemon can add new store paths.
+# - The project is bind-mounted at its original host absolute path.
+# - /tmp and /home/sandbox start as fresh per-run dirs, then selected host dirs
+#   are bind-mounted into them.
+NIX_CMD=("$NIX_BIN")
+if [[ -n "$PKGS" ]]; then
+  NIX_CMD+=(shell "${NIX_SHELL_FLAGS[@]}")
+  NIX_CMD+=("${NIX_PKGS[@]}")
+else
+  NIX_CMD+=(develop "${NIX_SHELL_FLAGS[@]}" --impure -f "$NIX_SHELL_FILE")
+fi
+NIX_CMD+=(-c "$APP" "${APP_ARGS[@]}")
+
+if [[ "$SANDBOX_PRINT_BINDS_VALUE" == "1" ]]; then
+  echo "nix-sandbox: bind plan" >&2
+  print_bind_triplets BINDS_RO_PRE_RW
+  print_bind_triplets BINDS_RW
+  print_bind_triplets BINDS_RO
+  exit 0
+fi
+
+# Keep the launcher process cwd aligned with the effective project dir so
+# the terminal can infer the project dir for new terms.
+if [[ ! -d "$PROJECT_CHDIR" ]]; then
+  if [[ -n "$PROJECT_DIR" ]]; then
+    echo "error: app -C project path does not exist: $PROJECT_DIR (resolved: $PROJECT_CHDIR)" >&2
+  else
+    echo "error: resolved project path does not exist: $PROJECT_CHDIR" >&2
+  fi
+  exit 1
+fi
+cd "$PROJECT_CHDIR" || exit 1
+
+# NOTE: we don't use --new-session here which means the sandboxed
+# app can talk to the terminal and may be able to inject keypresses
+# potentially leading to RCE in the host. Read the manpage for details.
+# We want communication with the terminal however for, e.g. resizing,
+# so we don't sandbox that.
+exec bwrap \
+  --die-with-parent \
+  "${UNSHARE_BASE[@]}" \
+  "${NET_FLAGS[@]}" \
+  --proc /proc \
+  --dev /dev \
+  --clearenv \
+  --setenv HOME /home/sandbox \
+  --setenv USER sandbox \
+  --setenv LOGNAME sandbox \
+  --setenv TMPDIR /tmp \
+  --setenv SHELL "$BASH_BIN" \
+  --setenv PATH "$SANDBOX_PATH_VALUE" \
+  --setenv XDG_CACHE_HOME /home/sandbox/.cache \
+  --setenv XDG_CONFIG_HOME /home/sandbox/.config \
+  --setenv XDG_STATE_HOME /home/sandbox/.local/state \
+  --setenv XDG_DATA_HOME /home/sandbox/.local/share \
+  --chdir "$PROJECT_CHDIR" \
+  "${SETENV_EXTRA[@]}" \
+  "${ROOTFS_MKDIR_FLAGS[@]}" \
+  "${BINDS_RO_PRE_RW[@]}" \
+  "${BINDS_RW[@]}" \
+  "${BINDS_RO[@]}" \
+  "${WORKSPACE_MKDIR_FLAGS[@]}" \
+  "${NIX_CMD[@]}"
