@@ -6,6 +6,7 @@
 }:
 pkgs.mkShell {
   packages = with pkgs; [
+    # Tools
     git
     ripgrep
     fd
@@ -27,14 +28,22 @@ pkgs.mkShell {
     curl
     file
     which
+    direnv
+    nix
+
+    # Python & Packages
     python3
     python3Packages.pyyaml
     python3Packages.requests
     python3Packages.click
     python3Packages.rich
     python3Packages.pytest
-    direnv
-    nix
+
+    # Editors (for use via C-x e)
+    vim
+    neovim
+
+    # Agents
     pkgs-unstable.opencode
     # v1.1.53
     # (builtins.getFlake "github:anomalyco/opencode?rev=8ad5262a87e00ba9ee8ca9bde0b04d40024b37d4").packages.${builtins.currentSystem}.default

@@ -371,6 +371,9 @@ fi
 if [[ -n "${NIX_PATH:-}" ]]; then
   SETENV_EXTRA+=(--setenv NIX_PATH "$NIX_PATH")
 fi
+if [[ -n "${EDITOR:-}" ]]; then
+  SETENV_EXTRA+=(--setenv EDITOR "$EDITOR")
+fi
 
 # Nix paths we expose read/write so the daemon can materialize store paths and
 # sockets.
